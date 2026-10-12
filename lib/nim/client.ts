@@ -4,13 +4,13 @@ import OpenAI from 'openai'
 // Interactive chat wants speed → lightning, thinking disabled.
 // Personality reviews want depth + image understanding → kimi-k3 (multimodal, reasoning).
 // Chart-screenshot OCR wants the omni vision model.
-// nano is the universal fallback (text-only — reviews degrade to text-only context).
+// super-120b is the universal fallback (text-only — reviews degrade to text-only context).
 
 export const NIM_MODEL_FAST = 'nvidia/nemotron-3.5-lightning-30b-a3b'
 export const NIM_MODEL_VISION = 'moonshotai/kimi-k3'
 export const NIM_MODEL_OMNI = 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning'
-/** Replacement for nemotron-3-nano-30b-a3b, which reached end-of-life 2026-09-01 */
-export const NIM_FALLBACK_MODEL = 'nvidia/nemotron-nano-3-30b-a3b'
+/** nemotron-nano-3-30b-a3b 404s on the free endpoint; super-120b answers reviews in ~7s */
+export const NIM_FALLBACK_MODEL = 'nvidia/nemotron-3-super-120b-a12b'
 
 /** Cap for interactive (chat/suggestions) calls — fall back fast rather than hang */
 export const NIM_REQUEST_TIMEOUT_MS = 20_000

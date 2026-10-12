@@ -1,7 +1,7 @@
 import { createClient } from '@/lib/supabase/server'
 import { NextResponse } from 'next/server'
 import { createServiceClient } from '@/lib/supabase/service-client'
-import { getNimClient, NIM_MODEL_VISION, NIM_REQUEST_TIMEOUT_MS, withRateLimitRetry, mapWithConcurrency } from '@/lib/nim/client'
+import { getNimClient, NIM_MODEL_VISION, NIM_FALLBACK_MODEL, NIM_REQUEST_TIMEOUT_MS, withRateLimitRetry, mapWithConcurrency } from '@/lib/nim/client'
 import { parseNimJson } from '@/lib/nim/parse-nim-json'
 import { base64FromUrl } from '@/lib/nim/extract-trade-from-image'
 import { buildTradeContext } from '@/lib/nim/build-trade-context'
@@ -58,8 +58,12 @@ export async function POST(request: Request) {
       .eq('trade_id', tradeId)
       .maybeSingle()
 
-    if (existing) {
+    // A row where every personality failed (composite_score null) is retried, not served
+    if (existing && existing.composite_score !== null) {
       return NextResponse.json({ review: existing })
+    }
+    if (existing) {
+      await supabase.from('trade_reviews').delete().eq('id', existing.id)
     }
 
     const tradeContext = buildTradeContext(trade)
@@ -72,16 +76,19 @@ export async function POST(request: Request) {
       { key: 'risk_manager', prompt: RISK_MANAGER_PROMPT },
     ] as const
 
-    // Call all 5 personalities (2 at a time) with one fallback-model retry.
+    // Call all 5 personalities (2 at a time). Vision model only when there are
+    // screenshots to look at; otherwise (or on failure) the text-only fallback model.
     // NIM free tier 429s on wider bursts, so each call also backs off on 429.
+    const hasScreenshots = Array.isArray(trade.screenshot_urls) && trade.screenshot_urls.length > 0
     const results = await mapWithConcurrency([...personalities], 2, async ({ key, prompt }) => {
       const systemPrompt = buildReviewSystemPrompt(prompt)
       try {
-        return { key, review: await withRateLimitRetry(() => callNim(systemPrompt, tradeContext, trade.screenshot_urls)) }
+        if (!hasScreenshots) throw new Error('no screenshots — skip vision model')
+        return { key, review: await withRateLimitRetry(() => callNim(NIM_MODEL_VISION, systemPrompt, tradeContext, trade.screenshot_urls, NIM_REQUEST_TIMEOUT_MS)) }
       } catch {
-        // Retry once with fallback model (text-only — drop screenshots)
+        // Fallback model, text-only — drop screenshots
         try {
-          return { key, review: await callNim(systemPrompt, tradeContext, null) }
+          return { key, review: await withRateLimitRetry(() => callNim(NIM_FALLBACK_MODEL, systemPrompt, tradeContext, null)) }
         } catch (error) {
           console.error(`[api/review] ${key} failed after retry:`, error)
           return { key, review: null }
@@ -105,6 +112,13 @@ export async function POST(request: Request) {
     const compositeScore = scoreCount > 0
       ? Math.round((scoreSum / scoreCount) * 10) / 10
       : null
+
+    if (scoreCount === 0) {
+      return NextResponse.json(
+        { error: 'AI reviewers are unavailable right now. Please try again.' },
+        { status: 503 },
+      )
+    }
 
     // Store in trade_reviews using the regular client (RLS-enforced, correct user_id)
     const { data: inserted, error: insertError } = await supabase
@@ -143,9 +157,11 @@ export async function POST(request: Request) {
 /** Review with the vision model. When the trade has chart screenshots, they are
  *  attached as images so the reviewer judges the actual setup, not just numbers. */
 async function callNim(
+  model: string,
   systemPrompt: string,
   tradeContext: string,
   screenshotUrls: string[] | null | undefined,
+  timeoutMs?: number,
 ): Promise<PersonalityReview> {
   // Attach up to 3 screenshots; gracefully skip ones that fail to load
   const images: Array<Record<string, unknown>> = []
@@ -174,7 +190,7 @@ async function callNim(
 
   const completion = await getNimClient().chat.completions.create(
     {
-      model: NIM_MODEL_VISION,
+      model,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userContent as never },
@@ -182,7 +198,7 @@ async function callNim(
       max_tokens: 2048,
       temperature: 0.3,
     },
-    { timeout: NIM_REQUEST_TIMEOUT_MS },
+    timeoutMs ? { timeout: timeoutMs } : undefined,
   )
 
   const raw = completion.choices[0]?.message?.content
